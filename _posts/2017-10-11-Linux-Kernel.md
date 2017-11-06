@@ -1,0 +1,190 @@
+---
+layout: post
+title: "Exploiting CVE-2017-5123 with full protections. SMEP, SMAP, and the Chrome Sandbox!"
+---
+
+In this blog post I'm going to explain how to exploit CVE-2017-5123, a bug I found in the Linux kernel, and show how it can be used to escalate privileges, even with SMEP, SMAP and from inside the Chrome sandbox.
+
+### Background
+During system call handling, the kernel needs to be able to read and write to the memory of the process which invoked the system call.
+To do this the kernel has special functions such as `copy_from_user`, `put_user`, and others, which copy data to or from userland.
+On a very high level, `put_user` does approximately the following:
+
+{% highlight c %}
+put_user(x, void __user *ptr)
+    if (access_ok(VERIFY_WRITE, ptr, sizeof(*ptr)))
+        return -EFAULT
+    user_access_begin()
+    *ptr = x
+    user_access_end()
+{% endhighlight %}
+
+The `access_ok()` call checks that the ptr is in userland and not kernel memory.
+If this check passes, the `user_access_begin()` call disables [SMAP](https://en.wikipedia.org/wiki/Supervisor_Mode_Access_Prevention), allowing the kernel to access userland.
+The kernel does the memory write, and then re-enables SMAP.
+One important note here: these user access functions handle page faults during the memory read/write and will not cause a crash when accessing unmapped memory.
+
+### The Vulnerability
+Certain system calls require many calls to `put/get_user` to copy data between the kernel and userland. 
+To avoid the extra overhead of the repeated checks and SMAP enabling/disabling, the kernel developers included unsafe versions: `__put_user` and `unsafe_put_user`, which don't include the checks.
+Unsurprisingly, it's possible to forget the extra check.
+This is exactly what happened in CVE-2017-5123.
+In kernel version 4.13, the `waitid` syscall was updated to use `unsafe_put_user`, but the `access_ok` check was missing. 
+The vulnerable code is shown below.
+
+{% highlight c %}
+SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, struct siginfo __user *,
+                                  infop, int, options, struct rusage __user *, ru)
+{
+    struct rusage r;
+    struct waitid_info info = {.status = 0};
+    long err = kernel_waitid(which, upid, &info, options, ru ? &r : NULL);
+    int signo = 0;
+
+    if (err > 0) {
+        signo = SIGCHLD;
+        err = 0;
+        if (ru && copy_to_user(ru, &r, sizeof(struct rusage)))
+            return -EFAULT;
+        }
+        if (!infop)
+            return err;
+
+        user_access_begin();
+        unsafe_put_user(signo, &infop->si_signo, Efault);    <-    no access_ok call
+        unsafe_put_user(0, &infop->si_errno, Efault);
+        unsafe_put_user(info.cause, &infop->si_code, Efault);
+        unsafe_put_user(info.pid, &infop->si_pid, Efault);
+        unsafe_put_user(info.uid, &infop->si_uid, Efault);
+        unsafe_put_user(info.status, &infop->si_status, Efault);
+        user_access_end();
+        return err;
+Efault:
+        user_access_end();
+        return -EFAULT;
+}
+{% endhighlight %}
+
+### The primitive
+The lack of the `access_ok` check allows us to give a kernel address as the `infop` parameter of the `waitid` syscall and then the syscall will simply write the over that kernel address using `unsafe_put_user` because it is never checked.
+One tricky part of this primitive is we don’t have great control over what is written.
+It writes 6 different fields, and we don’t have full control over any one of them.
+`info.status` is a 32 bit int, but constrained to be 0 < status < 256.
+`info.pid` can be somewhat controlled by repeatedly forking, but has a max value of 0x8000.
+
+Here’s an overview of the fields written that we will refer to later during the exploit.
+{% highlight c %}
+struct siginfo {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    int padding;   // this remains unchanged by waitid
+    int pid;       // process id
+    int uid;       // user id
+    int status;    // return code
+}
+{% endhighlight %}
+
+
+
+### The chrome sandbox
+What makes this bug more interesting than just a privilege escalation is that it can be used from inside the Chrome sandbox.
+First, let’s explain what the Chrome Sandbox is and how it works.
+
+Google Chrome uses a sandbox to protect the browser, such that even if an exploit gets code execution, it can’t touch the rest of the system.
+There are two layers of sandboxes.
+The first restricts access to resources by changing the user id and doing a chroot.
+The second tries to limit the kernel attack surface using a seccomp filter to block system calls that aren't needed in the sandboxed process.
+This is normally fairly effective --- most Linux kernel vulnerabilities are in syscalls which are blocked by the seccomp sandbox.
+
+However, the waitid syscall is interesting is that it's commonly allowed in seccomp sandboxes and, sure enough, this includes the Chrome sandbox ([chrome seccomp source](https://chromium.googlesource.com/chromium/src.git/+/master/sandbox/linux/seccomp-bpf-helpers/)).
+This means we can attack the kernel to escape from the Chrome sandbox!
+
+One limitation imposed by the sandbox - fork is not allowed.
+We can only create new threads not processes.
+This is a problem because if we can’t fork, waitid will fail, and only allow us to write 0’s to kernel memory.
+
+### Taking a breather: Getting an infoleak
+You'll have to trust me that we'll be able to pwn this eventually.
+But either way, we'll need to know the kernel base address for exploiting, so let's get that first.
+A nice property of the `unsafe_put_user` is that it won't crash when accessing invalid memory addresses, and instead will just return `-EFAULT`.
+Thus, we can just keep guessing addresses where the kernel data section could be at until we get a different error code, then we know we found the kernel address, and can defeat KASLR. 
+Just be a little careful not to overwrite anything too important :)
+
+We can do the same to find the address of the kernel heap, or other regions of kernel memory.
+
+### An Unreliable Exploit Bypassing SMAP
+At this point, I wanted to see if it was possible to exploit this bug with full protections.
+As a recap, we are currently quite limited in what we can do:
+- We can only write 0's.
+- We write 24 bytes of 0's and will clobber nearby memory.
+- We don't have a [TODO italicize] great info leak. We can know where the kernel base is, where the heap is, but not where an object in the heap is.
+
+I thought for a while about different ways to exploit the bug, and identified a few directions:
+- Find an object in the kernel data section, where an index/size/value of zero would cause an out of bounds memory access. 
+- Overwrite a spinlock in the kernel to allow us to create a race condition.
+- Try overwriting a base pointer or other value on the kernel stack.
+- Trigger actions that will result in the creation of useful structures on the kernel heap, then see if we can hit them with our arbitrary write of 0’s.
+
+I ended up going with the fourth strategy and spraying the heap.
+
+### The heap spray
+At the beginning of the `task_struct` ([the structure representing each process and thread](http://elixir.free-electrons.com/linux/v4.13.11/source/include/linux/sched.h#L519)) is some flags, one if which marks if a seccomp filter is applied or not.
+If we can spray the heap with task_structs, and overwrite just those beginning flags, then we can remove seccomp from one of our processes and then we have some more hope.
+
+Since I'm not an expert at the Linux kernel heap, I first sprayed 10000 threads and then used a debugger to examine where the task structures were in the heap.
+I noticed that when I sprayed enough objects, most of the task structures would end up at a lower address in the heap than any structures that were there before.
+This seems to imply to that the heap would expand downward as the free slots are used up.
+
+The plan is then:
+- Create 10000 threads
+- Starting at the lowest address in the heap, keep guessing possible addresses that a task structure could be at
+- Have the 10000 threads keep checking if they are still in the seccomp sandbox
+- Stop when one finds that it no longer affected by seccomp.
+
+Turns out, this sort of works!
+Although it's unreliable, it works enough for a proof of concept, and I think it's likely that it could be made more reliable by tuning the spray more.
+Maybe if you spray other objects to fill in the "holes" first, and then free them after creating the 10000 threads, you can be more certain that the target task structures will be at the bottom of the heap.
+I haven't explored this enough, but currently it seems to work around 50% of the time on my computer, with the kernel crashing the 50% of the time.
+
+### Getting a better "Arbitrary" write
+At this point we have a task that is no longer in the seccomp sandbox, and we know the address that its `task_struct` is at from the previous step.
+We still need to figure out how to exploit the kernel from here to escalate to root privileges and remove the chroot.
+
+Fortunately, our primitive has gotten better, we can now use fork() to create children and, in turn, make `waitid` write non-zero values.
+Unfortunately, we still don't control much of the `siginfo` struct.
+The only values that seem usable are the `pid` and the `status`, both of which are limited.
+The maximum pid is 0x8000 and the status is a single byte.
+
+However, since the `pid` is right next to some unused padding (shown in the structure earlier), we can do 5 writes, shifting back a byte each time. to construct an arbitrary 5 byte write. 
+
+### 5 Byte Write + Physmap
+It's not straightforward to see how to use the 5 byte write we constructed above.
+We still can't create arbitrary addresses.
+We can however, create addresses that look like 0x**********000000, where the *'s can be anything.
+
+Here, I take inspiration from ret2dir.
+There is a section of kernel memory, called the [physmap](https://www.blackhat.com/docs/eu-14/materials/eu-14-Kemerlis-Ret2dir-Deconstructing-Kernel-Isolation.pdf), where the kernel keeps an 'alias', a second virtual address, mapped to the same physical memory as userspace memory.
+Thus, by creating a page filled with 0x41 in userland, there is actually an address in the kernel that we can find that exact same page filled with 0x41.
+
+My strategy here is to allocate a very large amount of memory in userland.
+Then try randomly overwriting pages in the kernel's physmap, while simultaneously checking if the userland page has changed.
+If we see a change, then we have found a kernel virtual address that corresponds to a userland address and we can write to userland to create our payload in kernel memory.
+I only try pages in the kernel's physmap where the address ends in six 0's, so that once we find an 'alias' we can construct a pointer to that kernel address.
+
+This part is very reliable, but on rare occasions can crash a random process. 
+
+### True Arbitrary Read/Write and Root!
+Now I overwrite the `files` pointer in the task_struct to point it at the 'alias' we found in the kernel, and in userland I construct a fake `files_struct` object which will also be at the `alias`.
+`file` objects, are quite nice, since they contain function pointers which you control the arguments to using functions such as `read`, `lseek`, `ioctl`. 
+By pointing `ioctl` at various ROP gadgets in the kernel we can create an arbitrary read and write primitive.
+I fix up the clobbered portions of the task_struct, change our creds structure to become root.
+Finally, I remove the chroot, by resetting the current fs .
+Now we have fully escaped the sandbox and can pop a calculator as root!
+
+This full exploit is available at [TODO](http://github.com/salls/todo)
+
+Thanks to the people at Chrome/Chromium security for the very quick response to my bug report!
+
+
+

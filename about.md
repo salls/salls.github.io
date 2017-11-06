@@ -4,12 +4,6 @@ title: About
 permalink: /about/
 ---
 
-Some information about you!
+Hi, I'm Chris Salls. I'm a computer security PhD student at UC Santa Barbara and the captain of the Shellphish CTF team.
 
-### More Information
-
-A place to include any other types of information that you'd like to include about yourself.
-
-### Contact me
-
-[email@domain.com](mailto:email@domain.com)
+The best way to get in touch with me is on Twitter: [@chris_salls](https://twitter.com/chris_salls)
